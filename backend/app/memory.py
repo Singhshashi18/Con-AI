@@ -185,6 +185,9 @@ def extract_edges(text: str) -> list[tuple[str, str, str, float]]:
 
     # Keep ordered rules so pronoun resolution can use earlier relations.
     rules = [
+        # Also-capturing rules
+        (rf"^{subject}\s+is\s+also\s+(?:a|an)\s+{entity}$", "is_a", 0.75),
+        (rf"^{subject}\s+is\s+also\s+{entity}$", "is_a", 0.75),
         (rf"^{subject}\s+is\s+(?:a|an)\s+{role}\s+at\s+{entity}$", "is_a_at", 0.82),
         (rf"^{subject}\s+(?:works?|worked|wrked)\s+as\s+(?:a|an)\s+{role}\s+at\s+{entity}$", "worked_as_at", 0.84),
         (rf"^{subject}\s+works\s+at\s+{entity}$", "works_at", 0.9),
