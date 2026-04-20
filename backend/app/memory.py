@@ -19,6 +19,17 @@ _PRONOUNS = {"it", "he", "she", "they", "this", "that", "him", "her", "them", "h
 _LEADING_NOISE = re.compile(r"^(?:and|or|but|so|then|also|at|in|from|to|with|for|of|on|the|a|an)\s+", re.IGNORECASE)
 _TRAILING_NOISE = re.compile(r"\s+(?:and|or|but|so|then|also)$", re.IGNORECASE)
 
+_ENTITY_BLOCKLIST = {
+    # discourse / filler
+    "additionally", "since", "because", "however", "therefore", "thus", "nice", "thanks", "thank", "okay", "ok",
+    "got", "noted", "sounds", "sounds like", "information", "conversation", "story", "details", "current", "first",
+    # generic nouns / sentence fragments
+    "change", "changes", "job", "transition", "role", "group", "network", "position", "situation", "setup",
+    # common verb / clause fragments that should never be entities
+    "work", "works", "worked", "is", "are", "was", "were", "been", "be", "live", "lives", "located",
+    "based", "lead", "leads", "partner", "partners", "joined", "moved", "and it is", "it is", "it was",
+}
+
 
 def sanitize_title(raw: str) -> str:
     trimmed = (raw or "").strip()
@@ -40,6 +51,9 @@ def infer_entity_type(entity_name: str) -> str:
 
     if re.search(r"\b(inc|corp|llc|ltd|technologies?|technology|solutions?|systems?|labs?|team|department|hcl|infosys|google|microsoft)\b", lowered):
         return "organization"
+
+    if re.search(r"\b(noida|ghaziabad|delhi|gurgaon|bengaluru|bangalore|mumbai|pune|hyderabad|sector\s*\d+)\b", lowered):
+        return "location"
 
     if re.search(r"(inc|corp|llc|ltd|technologies)$", entity_name, re.IGNORECASE):
         return "organization"
@@ -64,6 +78,17 @@ def _normalize_entity_name(raw: str) -> str:
     if not words:
         return ""
 
+    candidate_lower = " ".join(words).lower()
+    if candidate_lower in _ENTITY_BLOCKLIST:
+        return ""
+
+    if any(token.lower() in _ENTITY_BLOCKLIST for token in words):
+        return ""
+
+    # Reject long fragments that look like sentence clauses rather than names.
+    if len(words) >= 2 and any(word.lower() in {"and", "or", "but", "since", "because", "that", "which", "who", "whom"} for word in words):
+        return ""
+
     if len(words) == 1 and words[0].lower() in _ENTITY_IGNORE.union(_PRONOUNS):
         return ""
 
@@ -75,6 +100,15 @@ def _normalize_entity_name(raw: str) -> str:
 
     if len(words) > 5:
         words = words[:5]
+
+    # Strip leading filler again after truncation.
+    while words and words[0].lower() in {"and", "or", "but", "so", "then", "also", "at", "in", "from", "to", "with", "for", "of", "on"}:
+        words = words[1:]
+    if not words:
+        return ""
+
+    if len(words) == 1 and words[0].lower() in _ENTITY_BLOCKLIST:
+        return ""
 
     normalized_words: list[str] = []
     for word in words:
@@ -119,6 +153,15 @@ def extract_entities(text: str) -> list[str]:
         )
     )
 
+    # Capture name after explicit self-introduction forms.
+    candidates.extend(
+        re.findall(
+            r"\b(?:i\s+am|i'm|my\s+name\s+is|i\s+am\s+called|this\s+is)\s+([A-Za-z][A-Za-z0-9&.+#-]*(?:\s+[A-Za-z0-9&.+#-]+){0,2})",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
     entities: list[str] = []
     seen: set[str] = set()
     for candidate in candidates:
@@ -127,6 +170,8 @@ def extract_entities(text: str) -> list[str]:
             continue
         key = entity.lower()
         if key in seen:
+            continue
+        if key in _ENTITY_BLOCKLIST:
             continue
         seen.add(key)
         entities.append(entity)
@@ -141,12 +186,17 @@ def extract_edges(text: str) -> list[tuple[str, str, str, float]]:
     # Keep ordered rules so pronoun resolution can use earlier relations.
     rules = [
         (rf"^{subject}\s+is\s+(?:a|an)\s+{role}\s+at\s+{entity}$", "is_a_at", 0.82),
+        (rf"^{subject}\s+(?:works?|worked|wrked)\s+as\s+(?:a|an)\s+{role}\s+at\s+{entity}$", "worked_as_at", 0.84),
         (rf"^{subject}\s+works\s+at\s+{entity}$", "works_at", 0.9),
         (rf"^{subject}\s+work\s+at\s+{entity}$", "works_at", 0.9),
+        (rf"^{subject}\s+worked\s+at\s+{entity}$", "works_at", 0.88),
+        (rf"^{subject}\s+wrked\s+at\s+{entity}$", "works_at", 0.86),
         (rf"^{subject}\s+is\s+(?:a|an)\s+{entity}$", "is_a", 0.75),
         (rf"^{subject}\s+leads\s+{entity}$", "leads", 0.8),
         (rf"^{subject}\s+partners\s+with\s+{entity}$", "partners_with", 0.8),
         (rf"^{subject}\s+(?:is\s+)?located\s+in\s+{entity}$", "located_in", 0.78),
+        (rf"^{subject}\s+which\s+is\s+located\s+in\s+{entity}$", "located_in", 0.78),
+        (rf"^{subject}\s+which\s+is\s+based\s+in\s+{entity}$", "based_in", 0.76),
         (rf"^{subject}\s+(?:is\s+)?based\s+in\s+{entity}$", "based_in", 0.76),
         (rf"^{subject}\s+live\s+in\s+{entity}$", "lives_in", 0.75),
         (rf"^{subject}\s+lives\s+in\s+{entity}$", "lives_in", 0.75),
@@ -189,6 +239,23 @@ def extract_edges(text: str) -> list[tuple[str, str, str, float]]:
         normalized_clause = clause.strip().strip(" ,")
         if not normalized_clause:
             continue
+
+        # Handle chained relation in one clause: "X ... at Org which is located in Place"
+        chained = re.search(
+            rf"^{subject}\s+(?:works?|worked|wrked)\s+as\s+(?:a|an)\s+{role}\s+at\s+{entity}\s+which\s+is\s+located\s+in\s+{entity}$",
+            normalized_clause,
+            flags=re.IGNORECASE,
+        )
+        if chained:
+            person = chained.group(1).strip()
+            role_name = chained.group(2).strip()
+            org = chained.group(3).strip()
+            place = chained.group(4).strip()
+            add_edge(person, "is_a", role_name, 0.75)
+            add_edge(person, "works_at", org, 0.9)
+            add_edge(org, "located_in", place, 0.78)
+            continue
+
         for pattern, relation, confidence in rules:
             match = re.search(pattern, normalized_clause, flags=re.IGNORECASE)
             if not match:
@@ -196,14 +263,13 @@ def extract_edges(text: str) -> list[tuple[str, str, str, float]]:
             if relation == "is_a_at":
                 add_edge(match.group(1).strip(), "is_a", match.group(2).strip().rstrip("."), 0.75)
                 add_edge(match.group(1).strip(), "works_at", match.group(3).strip().rstrip("."), 0.9)
+            elif relation == "worked_as_at":
+                add_edge(match.group(1).strip(), "is_a", match.group(2).strip().rstrip("."), 0.75)
+                add_edge(match.group(1).strip(), "works_at", match.group(3).strip().rstrip("."), 0.9)
             else:
                 add_edge(match.group(1).strip(), relation, match.group(2).strip().rstrip("."), confidence)
             break
 
-    # Lightweight fallback for terse "X at Y" style mentions.
-    fallback = re.findall(rf"{subject}\s+at\s+{entity}", text, flags=re.IGNORECASE)
-    for src_raw, tgt_raw in fallback:
-        add_edge(src_raw, "associated_with", tgt_raw, 0.62)
     return edges[:16]
 
 
@@ -298,7 +364,7 @@ def build_cross_session_context(conversation: Conversation) -> str:
         title = sanitize_title(session.title or f"Conversation {session.id}")
         summary = ConversationSummary.query.filter_by(conversation_id=session.id).first()
         recap = (summary.summary[:240] if summary and summary.summary else "No summary yet.")
-
+     
         turns = (
             Message.query.filter_by(conversation_id=session.id)
             .order_by(Message.created_at.desc())

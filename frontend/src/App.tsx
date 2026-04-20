@@ -511,6 +511,7 @@ function App() {
                       event.stopPropagation()
                       setSelectedConversationId(conversation.id)
                       setHistoryMenuConversationId(null)
+                      setActiveRightView('chat') // Always go to chat view
                     }}
                   >
                     <span className="history-title">{conversation.title}</span>
@@ -805,23 +806,25 @@ function App() {
                     const src = graphLayout.positions.get(edge.source)
                     const tgt = graphLayout.positions.get(edge.target)
                     if (!src || !tgt) return null
-                    const nodeRadius = 24
-                    const arrowInset = 8
+                    const nodeRadius = 44 // bigger circle
+                    const arrowMargin = 10 // extra margin outside node
                     const dx = tgt.x - src.x
                     const dy = tgt.y - src.y
                     const distance = Math.hypot(dx, dy) || 1
                     const ux = dx / distance
                     const uy = dy / distance
-                    const startX = src.x + ux * (nodeRadius + 2)
-                    const startY = src.y + uy * (nodeRadius + 2)
-                    const endX = tgt.x - ux * (nodeRadius + arrowInset)
-                    const endY = tgt.y - uy * (nodeRadius + arrowInset)
-                    const midX = (src.x + tgt.x) / 2
-                    const midY = (src.y + tgt.y) / 2
+                    // Start arrow just outside source node, end arrow just outside target node
+                    const startX = src.x + ux * (nodeRadius + arrowMargin)
+                    const startY = src.y + uy * (nodeRadius + arrowMargin)
+                    const endX = tgt.x - ux * (nodeRadius + arrowMargin)
+                    const endY = tgt.y - uy * (nodeRadius + arrowMargin)
+                    // Place label 60% along the edge, offset perpendicular for clarity
+                    const labelPosX = src.x + dx * 0.6 + (-uy * 18)
+                    const labelPosY = src.y + dy * 0.6 + (ux * 18)
                     return (
                       <g key={edge.id}>
                         <line x1={startX} y1={startY} x2={endX} y2={endY} className="graph-edge" markerEnd="url(#graph-arrow)" />
-                        <text x={midX} y={midY - 8} textAnchor="middle" className="graph-edge-label">
+                        <text x={labelPosX} y={labelPosY} textAnchor="middle" className="graph-edge-label" alignmentBaseline="middle">
                           {edge.relation.replace('_', ' ')} ({edge.confidence.toFixed(2)})
                         </text>
                       </g>
@@ -832,9 +835,9 @@ function App() {
                     if (!pos) return null
                     return (
                       <g key={node.id}>
-                        <circle cx={pos.x} cy={pos.y} r="24" className="graph-node" />
-                        <text x={pos.x} y={pos.y + 4} textAnchor="middle" className="graph-node-label">
-                          {node.label.length > 18 ? `${node.label.slice(0, 18)}…` : node.label}
+                        <circle cx={pos.x} cy={pos.y} r="44" className="graph-node" />
+                        <text x={pos.x} y={pos.y + 8} textAnchor="middle" className="graph-node-label" alignmentBaseline="middle" fontSize={18} fontWeight={700}>
+                          {node.label}
                         </text>
                       </g>
                     )
