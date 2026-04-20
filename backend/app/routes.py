@@ -488,8 +488,9 @@ def chat_stream(conversation_id: int) -> Response:
                     for piece in iter_word_chunks(assistant_text):
                         yield sse_event({"type": "token", "token": piece})
 
-            update_entity_memory(conversation, content)
-            update_knowledge_graph(conversation, content)
+            extraction_corpus = f"{content}\n{assistant_text}"
+            update_entity_memory(conversation, extraction_corpus)
+            update_knowledge_graph(conversation, extraction_corpus)
 
             assistant_msg = Message(conversation_id=conversation.id, role="assistant", content=assistant_text)
             db.session.add(assistant_msg)

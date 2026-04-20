@@ -8,8 +8,9 @@ from .models import Conversation, Message
 def run_conversation_chain(conversation: Conversation, user_message: Message) -> tuple[str, dict[str, object]]:
     artifacts = chain_builder.generate(conversation, user_message.content)
 
-    update_entity_memory(conversation, user_message.content)
-    update_knowledge_graph(conversation, user_message.content)
+    extraction_corpus = f"{user_message.content}\n{artifacts.refined}"
+    update_entity_memory(conversation, extraction_corpus)
+    update_knowledge_graph(conversation, extraction_corpus)
 
     context_messages = Message.query.filter_by(conversation_id=conversation.id).order_by(Message.created_at.asc()).all()
     refresh_summary(conversation, context_messages)

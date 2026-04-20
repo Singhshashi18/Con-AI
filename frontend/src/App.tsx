@@ -38,6 +38,32 @@ type ChatMessage = {
   created_at: string
 }
 
+type EntityMemoryItem = {
+  id: number
+  entity_name: string
+  entity_type: string
+  facts: string
+  updated_at: string
+}
+
+type KnowledgeGraphNode = {
+  id: string
+  label: string
+}
+
+type KnowledgeGraphEdge = {
+  id: number
+  source: string
+  target: string
+  relation: string
+  confidence: number
+}
+
+type KnowledgeGraphPayload = {
+  nodes: KnowledgeGraphNode[]
+  edges: KnowledgeGraphEdge[]
+}
+
 const API_BASE = '/api'
 const PERSONA_TYPES = ['General Assistant', 'Code Helper', 'Creative Writer', 'Business Analyst', 'Study Buddy']
 const MEMORY_TYPES: MemoryStrategy[] = ['buffer', 'summary', 'entity', 'knowledge_graph', 'summary_entity']
@@ -64,6 +90,7 @@ function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [personaMenuOpen, setPersonaMenuOpen] = useState(false)
   const [memoryMenuOpen, setMemoryMenuOpen] = useState(false)
+  const [insightMenuOpen, setInsightMenuOpen] = useState(false)
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [personas, setPersonas] = useState<Persona[]>([])
   const [selectedConversationId, setSelectedConversationId] = useState<number | null>(null)
@@ -75,7 +102,13 @@ function App() {
   const [error, setError] = useState('')
   const [streamingAssistantId, setStreamingAssistantId] = useState<number | null>(null)
   const [awaitingFirstToken, setAwaitingFirstToken] = useState(false)
+  const [historyMenuConversationId, setHistoryMenuConversationId] = useState<number | null>(null)
+  const [activeRightView, setActiveRightView] = useState<'chat' | 'entity' | 'graph'>('chat')
+  const [entityMemory, setEntityMemory] = useState<EntityMemoryItem[]>([])
+  const [knowledgeGraph, setKnowledgeGraph] = useState<KnowledgeGraphPayload>({ nodes: [], edges: [] })
+  const [historySearch, setHistorySearch] = useState('')
   const messagesScrollRef = useRef<HTMLDivElement | null>(null)
+  const streamAbortRef = useRef<AbortController | null>(null)
 
   const selectedPersona = personas.find((persona) => persona.id === activePersonaId) || null
   const visibleMessages = useMemo(() => {
@@ -98,6 +131,38 @@ function App() {
       return currentContent !== previousContent
     })
   }, [messages])
+
+  const graphLayout = useMemo(() => {
+    const width = 920
+    const height = 500
+    const centerX = width / 2
+    const centerY = height / 2
+    const radius = Math.min(width, height) * 0.36
+    const count = Math.max(knowledgeGraph.nodes.length, 1)
+
+    const positions = new Map<string, { x: number; y: number }>()
+    knowledgeGraph.nodes.forEach((node, index) => {
+      const angle = (index / count) * Math.PI * 2
+      positions.set(node.id, {
+        x: centerX + Math.cos(angle) * radius,
+        y: centerY + Math.sin(angle) * radius,
+      })
+    })
+
+    return { width, height, positions }
+  }, [knowledgeGraph])
+
+  const filteredConversations = useMemo(() => {
+    const needle = historySearch.trim().toLowerCase()
+    if (!needle) {
+      return conversations
+    }
+    return conversations.filter((conversation) => {
+      const inTitle = conversation.title.toLowerCase().includes(needle)
+      const inLastMessage = (conversation.last_message || '').toLowerCase().includes(needle)
+      return inTitle || inLastMessage
+    })
+  }, [conversations, historySearch])
 
   async function loadPersonas() {
     const data = await request<Persona[]>('/personas')
@@ -125,6 +190,16 @@ function App() {
     setMessages(chat)
   }
 
+  async function loadEntityMemory(conversationId: number) {
+    const entities = await request<EntityMemoryItem[]>(`/conversations/${conversationId}/entity-memory`)
+    setEntityMemory(entities)
+  }
+
+  async function loadKnowledgeGraph(conversationId: number) {
+    const graph = await request<KnowledgeGraphPayload>(`/conversations/${conversationId}/knowledge-graph`)
+    setKnowledgeGraph(graph)
+  }
+
   useEffect(() => {
     void (async () => {
       try {
@@ -137,13 +212,19 @@ function App() {
 
   useEffect(() => {
     if (!selectedConversationId) return
-    void loadConversationDetails(selectedConversationId).catch((err) => setError((err as Error).message))
+    void Promise.all([
+      loadConversationDetails(selectedConversationId),
+      loadEntityMemory(selectedConversationId),
+      loadKnowledgeGraph(selectedConversationId),
+    ]).catch((err) => setError((err as Error).message))
   }, [selectedConversationId])
 
   useEffect(() => {
     const closeMenus = () => {
       setPersonaMenuOpen(false)
       setMemoryMenuOpen(false)
+      setInsightMenuOpen(false)
+      setHistoryMenuConversationId(null)
     }
 
     window.addEventListener('click', closeMenus)
@@ -182,7 +263,11 @@ function App() {
 
   async function handleSend(event: FormEvent) {
     event.preventDefault()
-    if (!selectedConversationId || !inputValue.trim() || sending) return
+    if (sending) {
+      streamAbortRef.current?.abort()
+      return
+    }
+    if (!selectedConversationId || !inputValue.trim()) return
 
     const conversationId = selectedConversationId
     const text = inputValue.trim()
@@ -204,11 +289,14 @@ function App() {
       let streamFailed = false
       let streamCompleted = false
       let receivedToken = false
+      const abortController = new AbortController()
+      streamAbortRef.current = abortController
 
       const response = await fetch(`${API_BASE}/conversations/${conversationId}/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text }),
+        signal: abortController.signal,
       })
 
       if (!response.ok || !response.body) {
@@ -286,11 +374,27 @@ function App() {
         setMessages((previous) => previous.filter((msg) => msg.id !== tempAssistantId))
       }
 
-      await Promise.all([loadConversations(), loadConversationDetails(conversationId)])
+      await Promise.all([
+        loadConversations(),
+        loadConversationDetails(conversationId),
+        loadEntityMemory(conversationId),
+        loadKnowledgeGraph(conversationId),
+      ])
     } catch (err) {
-      setError((err as Error).message)
-      await Promise.all([loadConversations(), loadConversationDetails(conversationId)])
+      if ((err as Error).name === 'AbortError') {
+        // Keep partially streamed content visible when user stops generation.
+        setError('')
+      } else {
+        setError((err as Error).message)
+        await Promise.all([
+          loadConversations(),
+          loadConversationDetails(conversationId),
+          loadEntityMemory(conversationId),
+          loadKnowledgeGraph(conversationId),
+        ])
+      }
     } finally {
+      streamAbortRef.current = null
       setStreamingAssistantId(null)
       setAwaitingFirstToken(false)
       setSending(false)
@@ -311,8 +415,60 @@ function App() {
     }
   }
 
+  async function handleDeleteConversation(conversationId: number) {
+    try {
+      setError('')
+      await request<{ deleted: boolean }>(`/conversations/${conversationId}`, {
+        method: 'DELETE',
+      })
+      if (selectedConversationId === conversationId) {
+        setMessages([])
+        setEntityMemory([])
+        setKnowledgeGraph({ nodes: [], edges: [] })
+      }
+      setHistoryMenuConversationId(null)
+      await loadConversations()
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }
+
+  async function handleExportConversationPdf(conversationId: number) {
+    try {
+      setError('')
+      const response = await fetch(`${API_BASE}/conversations/${conversationId}/export?format=pdf`)
+      if (!response.ok) {
+        throw new Error(await response.text())
+      }
+      const fileBlob = await response.blob()
+      const objectUrl = window.URL.createObjectURL(fileBlob)
+      const link = document.createElement('a')
+      link.href = objectUrl
+      link.download = `conversation_${conversationId}.pdf`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      window.URL.revokeObjectURL(objectUrl)
+      setHistoryMenuConversationId(null)
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }
+
+  async function handleRenameConversation(conversation: Conversation) {
+    const nextTitle = window.prompt('Rename chat', conversation.title)
+    if (!nextTitle || !nextTitle.trim()) return
+    await patchConversation(conversation.id, { title: nextTitle.trim() })
+    setHistoryMenuConversationId(null)
+  }
+
+  async function handleTogglePinConversation(conversation: Conversation) {
+    await patchConversation(conversation.id, { pinned: !conversation.pinned })
+    setHistoryMenuConversationId(null)
+  }
+
   return (
-    <div className="app-shell">
+    <div className={sidebarCollapsed ? 'app-shell sidebar-collapsed' : 'app-shell'}>
       <aside className={`sidebar ${sidebarCollapsed ? 'collapsed' : ''}`}>
         <div className="sidebar-top">
           <button
@@ -335,19 +491,82 @@ function App() {
 
         {!sidebarCollapsed && (
           <>
+            <input
+              className="sidebar-search"
+              value={historySearch}
+              onChange={(event) => setHistorySearch(event.target.value)}
+              placeholder="Search history"
+              onClick={(event) => event.stopPropagation()}
+            />
             <div className="sidebar-section-label">Conversation history</div>
             <div className="history-list">
-              {conversations.map((conversation) => (
-                <button
+              {filteredConversations.map((conversation) => (
+                <div
                   key={conversation.id}
-                  className={conversation.id === selectedConversationId ? 'history-item active' : 'history-item'}
-                  onClick={(event) => {
-                    event.stopPropagation()
-                    setSelectedConversationId(conversation.id)
-                  }}
+                  className={conversation.id === selectedConversationId ? 'history-item-row active' : 'history-item-row'}
                 >
-                  <span className="history-title">{conversation.title}</span>
-                </button>
+                  <button
+                    className={conversation.id === selectedConversationId ? 'history-item active' : 'history-item'}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      setSelectedConversationId(conversation.id)
+                      setHistoryMenuConversationId(null)
+                    }}
+                  >
+                    <span className="history-title">{conversation.title}</span>
+                  </button>
+
+                  <button
+                    className="history-item-menu"
+                    aria-label="Open conversation actions"
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      setHistoryMenuConversationId((current) => (current === conversation.id ? null : conversation.id))
+                    }}
+                  >
+                    •••
+                  </button>
+
+                  {historyMenuConversationId === conversation.id && (
+                    <div
+                      className="history-actions-menu"
+                      onClick={(event) => event.stopPropagation()}
+                    >
+                      <button
+                        className="dropdown-item"
+                        onClick={() => {
+                          void handleTogglePinConversation(conversation)
+                        }}
+                      >
+                        {conversation.pinned ? 'Unpin chat' : 'Pin chat'}
+                      </button>
+                      <button
+                        className="dropdown-item"
+                        onClick={() => {
+                          void handleRenameConversation(conversation)
+                        }}
+                      >
+                        Rename chat
+                      </button>
+                      <button
+                        className="dropdown-item"
+                        onClick={() => {
+                          void handleExportConversationPdf(conversation.id)
+                        }}
+                      >
+                        Export chat (PDF)
+                      </button>
+                      <button
+                        className="dropdown-item danger"
+                        onClick={() => {
+                          void handleDeleteConversation(conversation.id)
+                        }}
+                      >
+                        Delete chat
+                      </button>
+                    </div>
+                  )}
+                </div>
               ))}
             </div>
           </>
@@ -357,11 +576,24 @@ function App() {
       <main className="main-stage" onClick={() => {
         setPersonaMenuOpen(false)
         setMemoryMenuOpen(false)
+        setInsightMenuOpen(false)
       }}>
         <header className="topbar">
           <div className="topbar-left">
-            <span className="conversation-name">con-ai</span>
-            <span className="chevron">▾</span>
+            <button
+              className="topbar-home-btn"
+              onClick={(event) => {
+                event.stopPropagation()
+                setActiveRightView('chat')
+                setPersonaMenuOpen(false)
+                setMemoryMenuOpen(false)
+                setInsightMenuOpen(false)
+              }}
+              aria-label="Go to chat view"
+            >
+              <span className="conversation-name">con-ai</span>
+              <span className="chevron">▾</span>
+            </button>
 
             <div className="topbar-right">
             <button
@@ -373,7 +605,8 @@ function App() {
               }}
               aria-label="Open persona menu"
             >
-              •••
+              <span className="menu-dot-label">Personas</span>
+              <span className="menu-dot-icon">{personaMenuOpen ? '▴' : '▾'}</span>
             </button>
 
             {personaMenuOpen && (
@@ -412,10 +645,12 @@ function App() {
                 event.stopPropagation()
                 setMemoryMenuOpen((value) => !value)
                 setPersonaMenuOpen(false)
+                setInsightMenuOpen(false)
               }}
               aria-label="Open memory menu"
             >
-              •••
+              <span className="menu-dot-label">Memories</span>
+              <span className="menu-dot-icon">{memoryMenuOpen ? '▴' : '▾'}</span>
             </button>
 
             {memoryMenuOpen && (
@@ -439,49 +674,176 @@ function App() {
                 ))}
               </div>
             )}
+
+            <button
+              className="menu-dot"
+              onClick={(event) => {
+                event.stopPropagation()
+                setInsightMenuOpen((value) => !value)
+                setPersonaMenuOpen(false)
+                setMemoryMenuOpen(false)
+              }}
+              aria-label="Open insight menu"
+            >
+              <span className="menu-dot-label">Visualization</span>
+              <span className="menu-dot-icon">{insightMenuOpen ? '▴' : '▾'}</span>
+            </button>
+
+            {insightMenuOpen && (
+              <div className="dropdown-panel dropdown-panel-far-right">
+                <div className="dropdown-title">Right section</div>
+                <button
+                  className={activeRightView === 'entity' ? 'dropdown-item active' : 'dropdown-item'}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    setActiveRightView('entity')
+                    setInsightMenuOpen(false)
+                  }}
+                >
+                  Entity memory
+                </button>
+                <button
+                  className={activeRightView === 'graph' ? 'dropdown-item active' : 'dropdown-item'}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    setActiveRightView('graph')
+                    setInsightMenuOpen(false)
+                  }}
+                >
+                  Knowledge graph
+                </button>
+                <button
+                  className={activeRightView === 'chat' ? 'dropdown-item active' : 'dropdown-item'}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    setActiveRightView('chat')
+                    setInsightMenuOpen(false)
+                  }}
+                >
+                  Back to chat
+                </button>
+              </div>
+            )}
             </div>
           </div>
         </header>
 
-        <section className="chat-area">
-          <div className="messages-scroll" ref={messagesScrollRef}>
-            {visibleMessages.map((message) => (
-              <div key={message.id} className={`chat-row ${message.role}`}>
-                <div className={`chat-bubble ${message.role}`}>
-                  {message.role === 'assistant' && message.id === streamingAssistantId && awaitingFirstToken && !message.content.trim() ? (
-                    <div className="thinking-wrap" aria-label="Assistant is thinking">
-                      <span className="thinking-logo" aria-hidden="true" />
-                      <span className="thinking-dots" aria-hidden="true">
-                        <span />
-                        <span />
-                        <span />
-                      </span>
+        {activeRightView === 'chat' ? (
+          <>
+            <section className="chat-area">
+              <div className="messages-scroll" ref={messagesScrollRef}>
+                {visibleMessages.map((message) => (
+                  <div key={message.id} className={`chat-row ${message.role}`}>
+                    <div className={`chat-bubble ${message.role}`}>
+                      {message.role === 'assistant' && message.id === streamingAssistantId && awaitingFirstToken && !message.content.trim() ? (
+                        <div className="thinking-wrap" aria-label="Assistant is thinking">
+                          <span className="thinking-logo" aria-hidden="true" />
+                          <span className="thinking-dots" aria-hidden="true">
+                            <span />
+                            <span />
+                            <span />
+                          </span>
+                        </div>
+                      ) : (
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                      )}
                     </div>
-                  ) : (
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
-                  )}
-                </div>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
 
-          <div className="status-row">
-            <div className="status-pill">Persona: {selectedPersona?.name || 'General Assistant'}</div>
-            <div className="status-pill">Memory: {activeMemory.replace('_', ' ')}</div>
-          </div>
-        </section>
+              <div className="status-row">
+                <div className="status-pill">Persona: {selectedPersona?.name || 'General Assistant'}</div>
+                <div className="status-pill">Memory: {activeMemory.replace('_', ' ')}</div>
+              </div>
+            </section>
 
-        <form className="composer-shell" onSubmit={handleSend}>
-          <button type="button" className="composer-icon">＋</button>
-          <input
-            value={inputValue}
-            onChange={(event) => setInputValue(event.target.value)}
-            placeholder="Ask anything"
-          />
-          <button type="submit" className="composer-send" disabled={sending}>
-            ➤
-          </button>
-        </form>
+            <form className="composer-shell" onSubmit={handleSend}>
+              <button type="button" className="composer-icon">＋</button>
+              <input
+                value={inputValue}
+                onChange={(event) => setInputValue(event.target.value)}
+                placeholder="Ask anything"
+              />
+              <button type="submit" className="composer-send" aria-label={sending ? 'Stop generation' : 'Send message'}>
+                {sending ? '■' : '➤'}
+              </button>
+            </form>
+          </>
+        ) : activeRightView === 'entity' ? (
+          <section className="insight-section">
+            <h3 className="insight-title">Entity Memory Dashboard</h3>
+            {entityMemory.length === 0 ? (
+              <div className="insight-empty">No entities found for this conversation yet.</div>
+            ) : (
+              <div className="entity-grid">
+                {entityMemory.map((item) => (
+                  <article key={item.id} className="entity-card">
+                    <div className="entity-name">{item.entity_name}</div>
+                    <div className="entity-type">{item.entity_type}</div>
+                    <div className="entity-facts">{item.facts || 'No facts stored yet.'}</div>
+                    <div className="entity-updated">Updated: {new Date(item.updated_at).toLocaleString()}</div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+        ) : (
+          <section className="insight-section">
+            <h3 className="insight-title">Knowledge Graph Visualization</h3>
+            {knowledgeGraph.nodes.length === 0 ? (
+              <div className="insight-empty">No knowledge graph relationships found yet.</div>
+            ) : (
+              <div className="graph-shell">
+                <svg className="graph-svg" viewBox={`0 0 ${graphLayout.width} ${graphLayout.height}`}>
+                  <defs>
+                    <marker id="graph-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                      <path d="M 0 0 L 10 5 L 0 10 z" fill="rgba(255,255,255,0.6)" />
+                    </marker>
+                  </defs>
+                  {knowledgeGraph.edges.map((edge) => {
+                    const src = graphLayout.positions.get(edge.source)
+                    const tgt = graphLayout.positions.get(edge.target)
+                    if (!src || !tgt) return null
+                    const nodeRadius = 24
+                    const arrowInset = 8
+                    const dx = tgt.x - src.x
+                    const dy = tgt.y - src.y
+                    const distance = Math.hypot(dx, dy) || 1
+                    const ux = dx / distance
+                    const uy = dy / distance
+                    const startX = src.x + ux * (nodeRadius + 2)
+                    const startY = src.y + uy * (nodeRadius + 2)
+                    const endX = tgt.x - ux * (nodeRadius + arrowInset)
+                    const endY = tgt.y - uy * (nodeRadius + arrowInset)
+                    const midX = (src.x + tgt.x) / 2
+                    const midY = (src.y + tgt.y) / 2
+                    return (
+                      <g key={edge.id}>
+                        <line x1={startX} y1={startY} x2={endX} y2={endY} className="graph-edge" markerEnd="url(#graph-arrow)" />
+                        <text x={midX} y={midY - 8} textAnchor="middle" className="graph-edge-label">
+                          {edge.relation.replace('_', ' ')} ({edge.confidence.toFixed(2)})
+                        </text>
+                      </g>
+                    )
+                  })}
+                  {knowledgeGraph.nodes.map((node) => {
+                    const pos = graphLayout.positions.get(node.id)
+                    if (!pos) return null
+                    return (
+                      <g key={node.id}>
+                        <circle cx={pos.x} cy={pos.y} r="24" className="graph-node" />
+                        <text x={pos.x} y={pos.y + 4} textAnchor="middle" className="graph-node-label">
+                          {node.label.length > 18 ? `${node.label.slice(0, 18)}…` : node.label}
+                        </text>
+                      </g>
+                    )
+                  })}
+                </svg>
+              </div>
+            )}
+          </section>
+        )}
 
         {error && <div className="error-banner">{error}</div>}
       </main>

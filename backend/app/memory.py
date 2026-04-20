@@ -8,6 +8,17 @@ from .models import Conversation, ConversationSummary, EntityMemory, KnowledgeEd
 MEMORY_STRATEGIES = ("buffer", "summary", "entity", "knowledge_graph", "summary_entity")
 DOMAIN_FOCUS = ("general", "technical", "creative", "business")
 
+_ENTITY_IGNORE = {
+    "i", "we", "the", "a", "an", "ai", "it", "today", "tomorrow", "there", "here", "this", "that",
+    "he", "she", "they", "you", "me", "my", "your", "our", "their", "and", "or", "but", "is", "are",
+    "himself", "herself", "themselves",
+}
+
+_PRONOUNS = {"it", "he", "she", "they", "this", "that", "him", "her", "them", "himself", "herself", "themselves"}
+
+_LEADING_NOISE = re.compile(r"^(?:and|or|but|so|then|also|at|in|from|to|with|for|of|on|the|a|an)\s+", re.IGNORECASE)
+_TRAILING_NOISE = re.compile(r"\s+(?:and|or|but|so|then|also)$", re.IGNORECASE)
+
 
 def sanitize_title(raw: str) -> str:
     trimmed = (raw or "").strip()
@@ -17,38 +28,182 @@ def sanitize_title(raw: str) -> str:
 
 
 def infer_entity_type(entity_name: str) -> str:
+    lowered = (entity_name or "").strip().lower()
+    if not lowered:
+        return "entity"
+
+    if re.search(r"\b(developer|engineer|manager|analyst|designer|architect|lead|consultant|specialist|intern)\b", lowered):
+        return "role"
+
+    if re.search(r"\b(delhi|ghaziabad|noida|gurgaon|bengaluru|bangalore|mumbai|pune|hyderabad|india|city|state|country)\b", lowered):
+        return "location"
+
+    if re.search(r"\b(inc|corp|llc|ltd|technologies?|technology|solutions?|systems?|labs?|team|department|hcl|infosys|google|microsoft)\b", lowered):
+        return "organization"
+
     if re.search(r"(inc|corp|llc|ltd|technologies)$", entity_name, re.IGNORECASE):
-        return "company"
+        return "organization"
+
     if len(entity_name.split()) >= 2:
         return "person"
     return "entity"
 
 
+def _normalize_entity_name(raw: str) -> str:
+    cleaned = (raw or "").strip().strip("\"'`.,;:!?()[]{}")
+    cleaned = re.sub(r"\bteh\b", "the", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = _LEADING_NOISE.sub("", cleaned)
+    cleaned = _TRAILING_NOISE.sub("", cleaned)
+    cleaned = " ".join(re.findall(r"[A-Za-z0-9&.+#-]+", cleaned))
+    if not cleaned:
+        return ""
+
+    words = cleaned.split()
+    words = [word for word in words if word.lower() not in {"himself", "herself", "themselves"}]
+    if not words:
+        return ""
+
+    if len(words) == 1 and words[0].lower() in _ENTITY_IGNORE.union(_PRONOUNS):
+        return ""
+
+    if words[0].lower() in _PRONOUNS:
+        return ""
+
+    if any(word.lower() in {"works", "leads", "partners", "located", "based", "lives", "resides"} for word in words):
+        return ""
+
+    if len(words) > 5:
+        words = words[:5]
+
+    normalized_words: list[str] = []
+    for word in words:
+        if word.isupper() and len(word) <= 5:
+            normalized_words.append(word)
+        else:
+            normalized_words.append(word.capitalize())
+    return " ".join(normalized_words)
+
+
+def _split_clauses(text: str) -> list[str]:
+    # Split on punctuation and on conjunctions that usually introduce a new fact.
+    base_parts = re.split(r"[\n\r]+|[.;!?]+", text)
+    clauses: list[str] = []
+    for part in base_parts:
+        for clause in re.split(r"\s+\band\b\s+(?=(?:it|he|she|they|[A-Za-z])\b)", part, flags=re.IGNORECASE):
+            candidate = clause.strip().strip(",")
+            if candidate:
+                clauses.append(candidate)
+    return clauses
+
+
 def extract_entities(text: str) -> list[str]:
-    candidates = re.findall(r"\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)?\b", text)
-    ignore = {"I", "We", "The", "A", "An", "AI", "It", "Today", "Tomorrow"}
-    entities = []
-    for entity in candidates:
-        if entity in ignore:
+    candidates: list[str] = []
+
+    # Use extracted graph edges as high-confidence entity signals.
+    for source, _relation, target, _confidence in extract_edges(text):
+        candidates.extend([source, target])
+
+    # Title-cased person/place/org names.
+    candidates.extend(re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b", text))
+
+    # Acronyms/org names like HCL, IBM, TCS.
+    candidates.extend(re.findall(r"\b[A-Z]{2,6}\b", text))
+
+    # Common intro phrases for entities.
+    candidates.extend(
+        re.findall(
+            r"\b(?:my\s+friend|friend|name\s+is|called)\s+([A-Za-z][A-Za-z0-9&.+#-]*(?:\s+[A-Za-z0-9&.+#-]+){0,2})",
+            text,
+            flags=re.IGNORECASE,
+        )
+    )
+
+    entities: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        entity = _normalize_entity_name(candidate)
+        if not entity:
             continue
-        if entity not in entities:
-            entities.append(entity)
-    return entities[:12]
+        key = entity.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entities.append(entity)
+    return entities[:16]
 
 
 def extract_edges(text: str) -> list[tuple[str, str, str, float]]:
+    subject = r"([A-Za-z][A-Za-z0-9&.+#-]*(?:\s+[A-Za-z0-9&.+#-]+){0,2})"
+    entity = r"([A-Za-z][A-Za-z0-9&.+#-]*(?:\s+[A-Za-z0-9&.+#-]+){0,4})"
+    role = r"([A-Za-z][A-Za-z0-9&.+#-]*(?:\s+[A-Za-z0-9&.+#-]+){0,3})"
+
+    # Keep ordered rules so pronoun resolution can use earlier relations.
     rules = [
-        (r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\s+works at\s+([A-Z][\w\s]+)", "works_at", 0.9),
-        (r"([A-Z][\w\s]+)\s+is a\s+([a-z][\w\s]+)", "is_a", 0.75),
-        (r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\s+leads\s+([A-Z][\w\s]+)", "leads", 0.8),
-        (r"([A-Z][\w\s]+)\s+partners with\s+([A-Z][\w\s]+)", "partners_with", 0.8),
+        (rf"^{subject}\s+is\s+(?:a|an)\s+{role}\s+at\s+{entity}$", "is_a_at", 0.82),
+        (rf"^{subject}\s+works\s+at\s+{entity}$", "works_at", 0.9),
+        (rf"^{subject}\s+work\s+at\s+{entity}$", "works_at", 0.9),
+        (rf"^{subject}\s+is\s+(?:a|an)\s+{entity}$", "is_a", 0.75),
+        (rf"^{subject}\s+leads\s+{entity}$", "leads", 0.8),
+        (rf"^{subject}\s+partners\s+with\s+{entity}$", "partners_with", 0.8),
+        (rf"^{subject}\s+(?:is\s+)?located\s+in\s+{entity}$", "located_in", 0.78),
+        (rf"^{subject}\s+(?:is\s+)?based\s+in\s+{entity}$", "based_in", 0.76),
+        (rf"^{subject}\s+live\s+in\s+{entity}$", "lives_in", 0.75),
+        (rf"^{subject}\s+lives\s+in\s+{entity}$", "lives_in", 0.75),
+        (rf"^{subject}\s+resides\s+in\s+{entity}$", "lives_in", 0.75),
+        (rf"^{subject}\s+moved\s+to\s+{entity}$", "moved_to", 0.72),
+        (rf"^{subject}\s+joined\s+{entity}$", "joined", 0.72),
     ]
     edges: list[tuple[str, str, str, float]] = []
-    for pattern, relation, confidence in rules:
-        for match in re.finditer(pattern, text):
-            src = match.group(1).strip()
-            tgt = match.group(2).strip().rstrip(".")
-            edges.append((src, relation, tgt, confidence))
+    seen: set[tuple[str, str, str]] = set()
+    context_subject = ""
+    context_org = ""
+
+    def add_edge(src_raw: str, relation: str, tgt_raw: str, confidence: float) -> None:
+        nonlocal context_subject, context_org
+
+        src = _normalize_entity_name(src_raw)
+        tgt = _normalize_entity_name(tgt_raw)
+        if not tgt:
+            return
+
+        if src_raw.strip().lower() in _PRONOUNS and context_org:
+            src = context_org
+        elif src_raw.strip().lower() in _PRONOUNS and context_subject:
+            src = context_subject
+
+        if not src:
+            return
+
+        key = (src.lower(), relation, tgt.lower())
+        if key in seen:
+            return
+        seen.add(key)
+        edges.append((src, relation, tgt, confidence))
+
+        context_subject = src
+        if relation == "works_at":
+            context_org = tgt
+
+    for clause in _split_clauses(text):
+        normalized_clause = clause.strip().strip(" ,")
+        if not normalized_clause:
+            continue
+        for pattern, relation, confidence in rules:
+            match = re.search(pattern, normalized_clause, flags=re.IGNORECASE)
+            if not match:
+                continue
+            if relation == "is_a_at":
+                add_edge(match.group(1).strip(), "is_a", match.group(2).strip().rstrip("."), 0.75)
+                add_edge(match.group(1).strip(), "works_at", match.group(3).strip().rstrip("."), 0.9)
+            else:
+                add_edge(match.group(1).strip(), relation, match.group(2).strip().rstrip("."), confidence)
+            break
+
+    # Lightweight fallback for terse "X at Y" style mentions.
+    fallback = re.findall(rf"{subject}\s+at\s+{entity}", text, flags=re.IGNORECASE)
+    for src_raw, tgt_raw in fallback:
+        add_edge(src_raw, "associated_with", tgt_raw, 0.62)
     return edges[:16]
 
 
@@ -57,11 +212,11 @@ def update_entity_memory(conversation: Conversation, message_text: str) -> None:
     if not entities:
         return
 
+    existing_rows = EntityMemory.query.filter_by(conversation_id=conversation.id).all()
+    existing_by_key = {row.entity_name.lower(): row for row in existing_rows}
+
     for name in entities:
-        existing = EntityMemory.query.filter_by(
-            conversation_id=conversation.id,
-            entity_name=name,
-        ).first()
+        existing = existing_by_key.get(name.lower())
         fact = f"Mentioned in conversation: {message_text[:140]}"
         if existing:
             if fact not in existing.facts:
@@ -76,30 +231,32 @@ def update_entity_memory(conversation: Conversation, message_text: str) -> None:
             from . import db
 
             db.session.add(existing)
+            existing_by_key[name.lower()] = existing
 
 
 def update_knowledge_graph(conversation: Conversation, message_text: str) -> None:
     from . import db
 
+    existing_rows = KnowledgeEdge.query.filter_by(conversation_id=conversation.id).all()
+    existing_by_key = {
+        (row.source.lower(), row.relation, row.target.lower()): row
+        for row in existing_rows
+    }
+
     for source, relation, target, confidence in extract_edges(message_text):
-        edge = KnowledgeEdge.query.filter_by(
-            conversation_id=conversation.id,
-            source=source,
-            relation=relation,
-            target=target,
-        ).first()
+        edge = existing_by_key.get((source.lower(), relation, target.lower()))
         if edge:
             edge.confidence = max(edge.confidence, confidence)
         else:
-            db.session.add(
-                KnowledgeEdge(
-                    conversation_id=conversation.id,
-                    source=source,
-                    relation=relation,
-                    target=target,
-                    confidence=confidence,
-                )
+            edge = KnowledgeEdge(
+                conversation_id=conversation.id,
+                source=source,
+                relation=relation,
+                target=target,
+                confidence=confidence,
             )
+            db.session.add(edge)
+            existing_by_key[(source.lower(), relation, target.lower())] = edge
 
 
 def refresh_summary(conversation: Conversation, messages: Iterable[Message]) -> None:
